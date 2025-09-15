@@ -1,8 +1,39 @@
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# Base UBI image
+ARG BASE_UBI_IMAGE_TAG=9.5-1741850109
+ARG VLLM_VERSION="0.10.0.2"
+ARG PYTHON_VERSION=3.12
+ARG VLLM_TGIS_ADAPTER_VERSION="0.8.0"
 
-USER 1001
+###############################################################
+#                       BUILDER  STAGE                        #
+###############################################################
 
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${BASE_UBI_IMAGE_TAG} AS builder-base
 
+USER root
+ENV HOME=/root
+WORKDIR /root
+ENV CARGO_HOME=/root/.cargo \
+    RUSTUP_HOME=/root/.rustup \
+    PATH=$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH \
+    C_INCLUDE_PATH=/usr/local/include \
+    LD_LIBRARY_PATH=/usr/local/lib
+
+COPY . vllm-cpu/
+# expecting similar build_vllm_s390x.sh
+COPY build_vllm_*.sh ./
+
+# this script would build all necessary packages from source
+# and populate the uv cache with all trasitive dependencies of vllm
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/var/cache/dnf \
+    ./build_vllm_$(uname -m).sh
+
+###############################################################
+#                   FINAL VLLM IMAGE STAGE                    #
+###############################################################
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${BASE_UBI_IMAGE_TAG} AS vllm-openai
 
 LABEL name="rhoai/odh-vllm-cpu-rhel9" \
       com.redhat.component="odh-vllm-cpu-rhel9" \
@@ -11,3 +42,126 @@ LABEL name="rhoai/odh-vllm-cpu-rhel9" \
       description="CPU-only build of vLLM, optimized for running inference without requiring GPU hardware." \
       summary="CPU-only build of vLLM, optimized for running inference without requiring GPU hardware." \
       com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+ARG VLLM_VERSION
+ARG PYTHON_VERSION=3.12
+ENV VLLM_NO_USAGE_STATS=1
+
+# Set Environment Variables for venv & openblas
+ENV VIRTUAL_ENV=/opt/vllm
+ENV PATH=${VIRTUAL_ENV}/bin:$PATH:/usr/lib64/llvm15/bin
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig/
+ENV C_INCLUDE_PATH="/usr/local/include:$C_INCLUDE_PATH"
+ENV LD_LIBRARY_PATH=/opt/vllm/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:/usr/local/lib:$LD_LIBRARY_PATH:/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib
+ENV OMP_NUM_THREADS=16
+ENV UV_LINK_MODE=copy
+ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
+
+COPY . /workspace/vllm
+WORKDIR /workspace/vllm
+
+RUN if [ "$(uname -m)" = "ppc64le" ]; then \
+        rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+        && microdnf install --nodocs -y \
+              libomp tar findutils openssl llvm15 llvm15-devel \
+              pkgconfig xsimd g++ gcc-fortran libsndfile \
+              libtiff libjpeg openjpeg2 zlib zeromq \
+              freetype lcms2 libwebp tcl tk utf8proc \
+              harfbuzz fribidi libraqm libimagequant libxcb \
+        && microdnf clean all; \
+    fi
+
+RUN if [ "$(uname -m)" = "s390x" ]; then \
+        rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+        && microdnf install --nodocs -y \
+              gcc gcc-gfortran g++ make patch zlib-devel \
+              libjpeg-turbo-devel libtiff-devel libpng-devel libwebp-devel freetype-devel harfbuzz-devel \
+              openssl-devel openblas openblas-devel autoconf automake libtool cmake numpy libsndfile \
+              clang llvm15-devel llvm15-static llvm15 clang-devel git perl-core \
+        && microdnf clean all; \
+    fi
+
+RUN microdnf install -y \
+    python${PYTHON_VERSION}-devel python${PYTHON_VERSION}-pip python${PYTHON_VERSION}-wheel  && \
+    python${PYTHON_VERSION} -m venv $VIRTUAL_ENV && pip install --no-cache -U pip wheel uv && microdnf clean all
+
+# install gcc-11, python, openblas, numactl, lapack
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,from=builder-base,source=/root/numactl/,target=/numactl/,rw \
+    --mount=type=cache,from=builder-base,source=/root/lapack/,target=/lapack/,rw \
+    --mount=type=cache,from=builder-base,source=/root/OpenBLAS,target=/openblas/,rw \
+    make -C /numactl install \
+    && if [ "$(uname -m)" = "ppc64le" ]; then \
+        PREFIX=/usr/local make -C /openblas install \
+        && uv pip install --no-cache 'cmake<4' \
+        && cmake --install /lapack/build \
+        && uv pip uninstall cmake; \
+    fi
+
+# consume previously built wheels
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,from=builder-base,source=/wheelsdir/,target=/wheelsdir/,ro \
+    export PKG_CONFIG_PATH=$(find / -type d -name "pkgconfig" 2>/dev/null | tr '\n' ':') && \
+    # --offline will ensure wheels are picked from uv cache and nothing is pulled from pypi/built from source
+    # wheel should be present in /wheelsdir/ (transitive dependencies in uv cache )
+    HOME=/root uv pip install /wheelsdir/*.whl --offline
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    sed -i '/^torch/d' requirements/build.txt && \ 
+    uv pip install -v --index-strategy unsafe-best-match \
+    -r requirements/build.txt \
+    -r requirements/cpu.txt
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git tag -f "${VLLM_VERSION}" HEAD && \
+    SETUPTOOLS_SCM_PRETEND_VERSION="$VLLM_VERSION" \ 
+    VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 python setup.py bdist_wheel && \
+    uv pip install "$(echo dist/*.whl)[tensorizer]"
+
+WORKDIR /home/vllm
+
+# setup non-root user for OpenShift
+RUN umask 002 && \
+    useradd --uid 2000 --gid 0 vllm && \
+    mkdir -p /home/vllm && \
+    chmod g+rwx /home/vllm
+
+ENV HF_HUB_OFFLINE=0 \
+    HOME=/home/vllm \
+    # Allow requested max length to exceed what is extracted from the
+    # config.json
+    # see: https://github.com/vllm-project/vllm/pull/7080
+    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    VLLM_USAGE_SOURCE=production-docker-image \
+    VLLM_WORKER_MULTIPROC_METHOD=fork \
+    VLLM_NO_USAGE_STATS=1 \
+    OUTLINES_CACHE_DIR=/tmp/outlines \
+    VLLM_USE_V1=1
+
+COPY LICENSE /licenses/vllm.md
+COPY examples/*.jinja /app/data/template/
+
+USER 2000
+
+ENTRYPOINT ["python", "-m", "vllm.entrypoints.openai.api_server"]
+
+FROM vllm-openai as vllm-grpc-adapter
+
+USER root
+ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
+ARG VLLM_TGIS_ADAPTER_VERSION
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,from=builder-base,source=/wheelsdir/,target=/wheelsdir/,ro \
+    HOME=/root uv pip install "$(echo /workspace/vllm/dist/*.whl)[tensorizer]" vllm-tgis-adapter==${VLLM_TGIS_ADAPTER_VERSION}
+
+ENV GRPC_PORT=8033 \
+    PORT=8000 \
+    # As an optimization, vLLM disables logprobs when using spec decoding by
+    # default, but this would be unexpected to users of a hosted model that
+    # happens to have spec decoding
+    # see: https://github.com/vllm-project/vllm/pull/6485
+    DISABLE_LOGPROBS_DURING_SPEC_DECODING=false
+
+USER 2000
+
+ENTRYPOINT ["python", "-m", "vllm_tgis_adapter", "--uvicorn-log-level=warning"]
